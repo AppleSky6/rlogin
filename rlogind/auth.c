@@ -33,6 +33,8 @@
 
 #include <sys/types.h>
 #include <pwd.h>
+#include <stdio.h>
+#include <grp.h>
 
 #include "rlogind.h"
 
@@ -106,11 +108,12 @@ static int attempt_auth(void) {
  * or return 0 on authentication success. Dying is discouraged.
  */
 int auth_checkauth(const char *remoteuser, const char *host,
-		   char *localuser, size_t localusersize) 
+		   char *localuser, size_t localusersize, const char *line)
 {
     static struct pam_conv conv = { sock_conv, NULL };
     struct passwd *pwd;
-    char *ln;
+    const char *ln;
+    const void *vp;
     int retval;
 
     retval = pam_start("rlogin", localuser, &conv, &pamh);
@@ -122,7 +125,7 @@ int auth_checkauth(const char *remoteuser, const char *host,
     pam_set_item(pamh, PAM_USER, localuser);
     pam_set_item(pamh, PAM_RUSER, remoteuser);
     pam_set_item(pamh, PAM_RHOST, host);
-    pam_set_item(pamh, PAM_TTY, "tty");   /* ? */
+    pam_set_item(pamh, PAM_TTY, line);
 	
     network_confirm();
     retval = attempt_auth();
@@ -131,7 +134,8 @@ int auth_checkauth(const char *remoteuser, const char *host,
 	return -1;
     }
 
-    pam_get_item(pamh, PAM_USER, &ln);
+    pam_get_item(pamh, PAM_USER, &vp);
+    ln = vp;
     if (!ln || !*ln) {
 	/*
 	 * Authentication wasn't adequate for requirements.
@@ -204,7 +208,7 @@ void auth_finish(void) {}
  * or return 0 on authentication success. Dying is discouraged.
  */
 int auth_checkauth(const char *remoteuser, const char *host,
-		   char *localuser, size_t localusersize) 
+		   char *localuser, size_t localusersize, const char *line)
 {
     struct passwd *pwd;
 
@@ -236,7 +240,7 @@ int auth_checkauth(const char *remoteuser, const char *host,
 
     _check_rhosts_file = use_rhosts;
 
-    return ruserok(host, pwd->pw_uid==0, remoteuser, localuser);
+    return ruserok_af(host, pwd->pw_uid==0, remoteuser, localuser, AF_UNSPEC);
 }
 
 #endif /* PAM */

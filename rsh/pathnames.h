@@ -34,4 +34,4 @@
  *	$Id: pathnames.h,v 1.1 1996/07/15 19:58:37 dholland Exp $
  */
 
-#define	_PATH_RLOGIN	"/usr/bin/rlogin"
+#define	_PATH_RLOGIN	"/usr/bin/netkit-rlogin"

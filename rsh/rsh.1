@@ -74,15 +74,6 @@ option turns on socket debugging (using
 on the
 .Tn TCP
 sockets used for communication with the remote host.
-.It Fl k
-The
-.Fl k
-option causes
-.Nm rsh
-to obtain tickets for the remote host in
-.Ar realm
-instead of the remote host's realm as determined by
-.Xr krb_realmofhost  3  .
 .It Fl l
 By default, the remote username is the same as the local username.
 The
@@ -99,13 +90,6 @@ option redirects input from the special device
 (see the
 .Sx BUGS
 section of this manual page).
-.It Fl x
-The
-.Fl x
-option turns on
-.Tn DES
-encryption for all data exchange.
-This may introduce a significant delay in response time.
 .El
 .Pp
 If no

@@ -34,6 +34,7 @@
 #include <sys/param.h>       /* for MAXHOSTNAMELEN */
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <stdio.h>           /* for snprintf(), BUFSIZ */
@@ -45,89 +46,73 @@
 
 #include "rlogind.h"
 
-static int confirmed=0;
+int from_af;
+static int confirmed;
 static int netf;
-
-static const char *
-topdomain(const char *h)
-{
-	const char *p;
-	const char *maybe = NULL;
-	int dots = 0;
-
-	for (p = h + strlen(h); p >= h; p--) {
-		if (*p == '.') {
-			if (++dots == 2)
-				return (p);
-			maybe = p;
-		}
-	}
-	return (maybe);
-}
-
-/*
- * Check whether host h is in our local domain,
- * defined as sharing the last two components of the domain part,
- * or the entire domain part if the local domain has only one component.
- * If either name is unqualified (contains no '.'),
- * assume that the host is local, as it will be
- * interpreted as such.
- */
-static int
-local_domain(const char *h)
-{
-	char localhost[MAXHOSTNAMELEN];
-	const char *p1, *p2;
-
-	localhost[0] = 0;
-	(void) gethostname(localhost, sizeof(localhost));
-	p1 = topdomain(localhost);
-	p2 = topdomain(h);
-	if (p1 == NULL || p2 == NULL || !strcasecmp(p1, p2))
-		return(1);
-	return(0);
-}
 
 
 static char *
-find_hostname(const struct sockaddr_in *fromp, int *hostokp)
+find_hostname(const struct sockaddr *fromp, socklen_t fromlen, int *hostokp)
 {
-	struct hostent *hop;
+	struct addrinfo hints, *res, *res0;
+	char naddr[NI_MAXHOST];
+	char raddr[NI_MAXHOST];
+	char hbuf[NI_MAXHOST];
 	char *hname;
 	int hostok = 0;
+	struct sockaddr_in v4;
 
-	hop = gethostbyaddr((const char *)&fromp->sin_addr, 
-			    sizeof(struct in_addr), fromp->sin_family);
-	if (hop == NULL) {
-		hname = strdup(inet_ntoa(fromp->sin_addr));
+	if (fromp->sa_family == AF_INET6) {
+		const struct sockaddr_in6 *v6p = (const void *)fromp;
+
+		if (IN6_IS_ADDR_V4MAPPED(&v6p->sin6_addr)) {
+			v4.sin_family = AF_INET;
+			v4.sin_addr.s_addr = v6p->sin6_addr.s6_addr32[3];
+			fromp = (struct sockaddr *)&v4;
+		}
+	}
+
+	if (getnameinfo(fromp, fromlen, hbuf, sizeof(hbuf), NULL, 0,
+			NI_NAMEREQD)) {
+		if (getnameinfo(fromp, fromlen, hbuf, sizeof(hbuf), NULL, 0,
+				NI_NUMERICHOST))
+			strcpy(hbuf, "???");
+		hname = strdup(hbuf);
 		hostok = 1;
 	} 
-	else if (check_all || local_domain(hop->h_name)) {
+	else {
 		/*
 		 * If name returned by gethostbyaddr is in our domain,
 		 * attempt to verify that we haven't been fooled by someone
 		 * in a remote net; look up the name and check that this
 		 * address corresponds to the name.
 		 */
-		hname = strdup(hop->h_name);
-		hop = gethostbyname(hname);
-		if (hop) {
-		    for (; hop->h_addr_list[0]; hop->h_addr_list++) {
-			if (!memcmp(hop->h_addr_list[0], &fromp->sin_addr,
-				    sizeof(fromp->sin_addr))) {
-				hostok = 1;
-				break;
+		hname = strdup(hbuf);
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = fromp->sa_family;
+		hints.ai_socktype = SOCK_STREAM;
+		hints.ai_flags = AI_CANONNAME;
+		if (getaddrinfo(hbuf, NULL, &hints, &res0) == 0) {
+			if (getnameinfo(fromp, fromlen, naddr, sizeof(naddr),
+					NULL, 0, NI_NUMERICHOST))
+				strcpy(naddr, "???");
+			for (res = res0; res; res = res->ai_next) {
+				if (res->ai_family != fromp->sa_family)
+					continue;
+				if (getnameinfo(res->ai_addr, res->ai_addrlen,
+						raddr, sizeof(raddr), NULL, 0,
+						NI_NUMERICHOST) == 0
+				    && strcmp(naddr, raddr) == 0) {
+					free(hname);
+					hname = strdup(res->ai_canonname ?
+						res->ai_canonname : hbuf);
+					hostok = 1;
+					break;
+				}
 			}
-		    }
-		    /* not clear if this is worthwhile */
-		    free(hname);
-		    hname = strdup(hop->h_name);
+			freeaddrinfo(res0);
 		}
 	} 
-	else {
-		hname = strdup(hop->h_name);
-		hostok = 1;
-	}
 
 	/* 
 	 * Actually it might be null if we're out of memory, but
@@ -145,29 +130,42 @@ find_hostname(const struct sockaddr_in *fromp, int *hostokp)
 char * 
 network_init(int f, int *hostokp)
 {
-	struct sockaddr_in from, *fromp;
+	union {
+		struct sockaddr_in6 in6;
+		struct sockaddr_in in;
+		struct sockaddr_storage storage;
+		struct sockaddr addr;
+	} from;
+	struct sockaddr *const fromp = &from.addr;
 	socklen_t fromlen;
 	int on = 1;
 	char c;
 	char *hname;
 	int port;
+	int family;
 
-	from.sin_family = AF_INET;
 	fromlen = sizeof (from);
-	if (getpeername(f, (struct sockaddr *)&from, &fromlen) < 0) {
+	if (getpeername(f, fromp, &fromlen) < 0) {
 		syslog(LOG_ERR,"Can't get peer name of remote host: %m");
 		fatal(STDERR_FILENO, "Can't get peer name of remote host", 1);
 	}
 	if (keepalive &&
 	    setsockopt(f, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on)) < 0)
 		syslog(LOG_WARNING, "setsockopt (SO_KEEPALIVE): %m");
-#ifdef IP_TOS
+
+	family = fromp->sa_family;
+
+#if defined(SOL_IP) && defined(IP_TOS)
 	#define IPTOS_LOWDELAY          0x10
 	on = IPTOS_LOWDELAY;
-	if (setsockopt(f, IPPROTO_IP, IP_TOS, &on, sizeof(on)) < 0)
+	if (family == AF_INET &&
+	    setsockopt(f, SOL_IP, IP_TOS, &on, sizeof(on)) < 0)
 		syslog(LOG_WARNING, "setsockopt (IP_TOS): %m");
 #endif
-	fromp = &from;
+	on = 1;
+	if (disable_nagle &&
+	    setsockopt(f, SOL_TCP, TCP_NODELAY, &on, sizeof(on)) < 0) 
+		syslog(LOG_WARNING, "setsockopt (TCP_NODELAY): %m");
 
 	alarm(60);
 	read(f, &c, 1);
@@ -177,18 +175,28 @@ network_init(int f, int *hostokp)
 
 	alarm(0);
 
-	hname = find_hostname(fromp, hostokp);
+	hname = find_hostname(fromp, fromlen, hostokp);
 
-	port = ntohs(fromp->sin_port);
-	if (fromp->sin_family != AF_INET ||
-	    port >= IPPORT_RESERVED || port < IPPORT_RESERVED/2) {
-	    syslog(LOG_NOTICE, "Connection from %s on illegal port",
-		   inet_ntoa(fromp->sin_addr));
-	    fatal(f, "Permission denied", 0);
+	switch (family) {
+	case AF_INET:
+		port = from.in.sin_port;
+		break;
+	case AF_INET6:
+		port = from.in6.sin6_port;
+		break;
+	default:
+		syslog(LOG_NOTICE, "Connection with illegal family %d", family);
+		fatal(f, "Permission denied", 0);
+	}
+
+	port = ntohs(port);
+	if (port >= IPPORT_RESERVED || port < IPPORT_RESERVED/2) {
+		syslog(LOG_NOTICE, "Connection from %s on illegal port", hname);
+		fatal(f, "Permission denied", 0);
 	}
 
 #ifdef IP_OPTIONS
-	{
+	if (family == AF_INET) {
 	    u_char optbuf[BUFSIZ/3], *cp;
 	    char lbuf[BUFSIZ];
 	    int lboff;

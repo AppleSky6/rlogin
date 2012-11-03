@@ -7,7 +7,7 @@ rcp: rcp.o
 	$(CC) $(LDFLAGS) $^ $(LIBS) -o $@
 
 install: rcp
-	install -s -o root -m$(SUIDMODE) rcp $(INSTALLROOT)$(BINDIR)
+	install -o root -m$(SUIDMODE) rcp $(INSTALLROOT)$(BINDIR)
 	install -m$(MANMODE) rcp.1 $(INSTALLROOT)$(MANDIR)/man1
 
 clean:

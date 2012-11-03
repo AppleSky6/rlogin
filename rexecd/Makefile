@@ -9,7 +9,7 @@ include ../MRULES
 
 ifeq ($(USE_PAM),1)
 CFLAGS += -DUSE_PAM
-LIBS += -ldl -lpam
+LIBS += -ldl -lpam -lpam_misc
 endif
 
 ifeq ($(USE_SHADOW),1)
@@ -27,7 +27,7 @@ rexecd: rexecd.o
 	$(CC) $(LDFLAGS) $^ $(LIBS) -o $@
 
 install: rexecd
-	install -s -m$(DAEMONMODE) rexecd $(INSTALLROOT)$(SBINDIR)/in.rexecd
+	install -m$(DAEMONMODE) rexecd $(INSTALLROOT)$(SBINDIR)/in.rexecd
 	install -m$(MANMODE) rexecd.8 $(INSTALLROOT)$(MANDIR)/man8/in.rexecd.8
 	ln -sf in.rexecd.8 $(INSTALLROOT)$(MANDIR)/man8/rexecd.8
 ifeq ($(USE_PAM),1)

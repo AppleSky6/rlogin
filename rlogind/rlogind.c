@@ -53,7 +53,6 @@ char rcsid[] =
  */
 
 #include <sys/types.h>   /* for size_t */
-#include <sys/param.h>   /* for MAXPATHLEN */
 #include <sys/stat.h>    /* for chmod() */
 #include <sys/ioctl.h>   /* for TIOCPKT */
 #include <sys/time.h>    /* for FD_SET() et al. */
@@ -63,6 +62,8 @@ char rcsid[] =
 #include <arpa/inet.h>   /* for ntohs() */
 #include <stdio.h>       /* for EOF, BUFSIZ, snprintf() */
 #include <syslog.h>      /* for syslog() */
+#include <pty.h>         /* for openpty() */
+#include <utmp.h>        /* for login_tty() */
 #include <errno.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -72,21 +73,18 @@ char rcsid[] =
 #include "logwtmp.h"
 #include "rlogind.h"
 
-pid_t forkpty(int *, char *, struct termios *, struct winsize *);
-int logout(const char *);
-
 #ifndef TIOCPKT_WINDOW
 #define TIOCPKT_WINDOW 0x80
 #endif
 
 int keepalive = 1;
-int check_all = 0;
 int use_rhosts = 1;
-int allow_root_rhosts = 0;
-int deny_all_rhosts_hequiv = 0;
+int allow_root_rhosts;
+int deny_all_rhosts_hequiv;
+int disable_nagle;
 
 static char oobdata[] = {(char)TIOCPKT_WINDOW};
-static char line[MAXPATHLEN];
+static char *line;
 struct winsize win = { 0, 0, 0, 0 };
 
 
@@ -381,6 +379,7 @@ static void getstr(char *buf, int cnt, const char *errmsg) {
 
 static void doit(int netfd) {
     int master, pid, on = 1;
+    int slave;
     int authenticated = 0;
     char *hname;
     int hostok;
@@ -391,6 +390,12 @@ static void doit(int netfd) {
     getstr(rusername, sizeof(rusername), "remuser too long");
     getstr(lusername, sizeof(lusername), "locuser too long");
     getstr(termtype, sizeof(termtype), "Terminal type too long");
+
+    if (openpty(&master, &slave, 0, 0, &win) != 0) {
+	if (errno == ENOENT) fatal(netfd, "Out of ptys", 0);
+	fatal(netfd, "Openpty", 1);
+    }
+    line = ttyname(slave);
     
     /*
      * This function will either die, return -1 if authentication failed,
@@ -402,7 +407,7 @@ static void doit(int netfd) {
      */
     if (hostok) {
 	if (auth_checkauth(rusername, hname, 
-			   lusername, sizeof(lusername)) == 0) {
+			   lusername, sizeof(lusername), line) == 0) {
 	   authenticated=1;
 	}
     }
@@ -412,16 +417,19 @@ static void doit(int netfd) {
 	write(netfd, "rlogind: Host address mismatch.\r\n", 33);
     }
 
-    pid = forkpty(&master, line, NULL, &win);
-    if (pid < 0) {
-	if (errno == ENOENT) fatal(netfd, "Out of ptys", 0);
-	fatal(netfd, "Forkpty", 1);
+    if ((pid = fork()) < 0) {
+	fatal(netfd, "Fork", 1);
     }
     if (pid == 0) {
+	close(master);
+	if (login_tty(slave)) {
+	    fatal(netfd, "Login_tty", 1);
+	}
 	/* netfd should always be 0, but... */ 
 	if (netfd > 2) close(netfd);
 	child(hname, termtype, lusername, authenticated);
     }
+    close(slave);
     on = 1;
     ioctl(netfd, FIONBIO, &on);
     ioctl(master, FIONBIO, &on);
@@ -434,14 +442,14 @@ static void doit(int netfd) {
 
 int main(int argc, char **argv) {
     int ch;
-    use_rhosts = 1;     /* default */
 
     openlog("rlogind", LOG_PID | LOG_CONS, LOG_AUTH);
 
     opterr = 0;
-    while ((ch = getopt(argc, argv, "ahLln")) != EOF) {
+    while ((ch = getopt(argc, argv, "afhLln")) != EOF) {
 	switch (ch) {
-	    case 'a': check_all = 1; break;
+	    case 'a': break;
+	    case 'f': disable_nagle = 1; break;
 	    case 'h': allow_root_rhosts = 1; break;
 	    case 'L': deny_all_rhosts_hequiv = 1; break;
 	    case 'l': use_rhosts = 0; break;

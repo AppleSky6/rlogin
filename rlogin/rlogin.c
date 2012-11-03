@@ -66,6 +66,9 @@ char rcsid[] =
 #include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
+#if defined(linux) && defined(FSUID_HACK)
+#include <sys/fsuid.h>
+#endif
 
 /*
  * rlogin has problems with urgent data when logging into suns which
@@ -180,9 +183,12 @@ main(int argc, char **argv)
 
 	long omask;
 	int argoff, ch, dflag, one, uid;
+	int port;
 	char *host, *p, *user, term[1024];
 	const char *t;
 	char *null = NULL;
+	char *localname = NULL;
+	const char *serv = "login";
 
 	argoff = dflag = 0;
 	one = 1;
@@ -193,7 +199,8 @@ main(int argc, char **argv)
 	else
 		p = argv[0];
 
-	if (strcmp(p, "rlogin"))
+/* Modified for Debian by agi@inittab.org to allow calling rlogin as netkit-rlogin */
+	if (strcmp(p, "rlogin") && strcmp(p, "netkit-rlogin"))
 		host = p;
 
 	/* handle "rlogin host flags" */
@@ -202,7 +209,9 @@ main(int argc, char **argv)
 		argoff = 1;
 	}
 
-#define	OPTIONS	"8EKLde:l:"
+	uid = getuid();
+
+#define	OPTIONS	"8EKLde:i:l:p:"
 	while ((ch = getopt(argc - argoff, argv + argoff, OPTIONS)) != EOF)
 		switch(ch) {
 		case '8':
@@ -222,8 +231,19 @@ main(int argc, char **argv)
 		case 'e':
 			escapechar = getescape(optarg);
 			break;
+		case 'i':
+			localname = optarg;
+			break;
 		case 'l':
 			user = optarg;
+			break;
+		case 'p':
+			serv = optarg;
+			/* This isn't really needed
+			if (uid) {
+				fprintf(stderr, "rlogin: -p requires root privilege\n");
+				exit(1);
+			}*/
 			break;
 		case '?':
 		default:
@@ -240,19 +260,33 @@ main(int argc, char **argv)
 	if (*argv)
 		usage();
 
-	if (!(pw = getpwuid(uid = getuid()))) {
+	if (!(pw = getpwuid(uid))) {
 		fprintf(stderr, "rlogin: unknown user id.\n");
 		exit(1);
 	}
 	if (!user)
 		user = pw->pw_name;
 
-	sp = NULL;
-	if (sp == NULL)
-		sp = getservbyname("login", "tcp");
+	if (localname) {
+		if (uid) {
+			fprintf(stderr, "rlogin: -i requires root privilege\n");
+			exit(1);
+		}
+	} else {
+		localname = pw->pw_name;
+	}
+
+	sp = getservbyname(serv, "tcp");
 	if (sp == NULL) {
-		fprintf(stderr, "rlogin: login/tcp: unknown service.\n");
-		exit(1);
+		unsigned long u;
+		u = strtoul(serv, &p, 0);
+		if (!*serv || *p || (u == ULONG_MAX && errno == ERANGE)) {
+			fprintf(stderr, "rlogin: %s/tcp: unknown service.\n", serv);
+			exit(1);
+		}
+		port = htons(u);
+	} else {
+		port = sp->s_port;
 	}
 
 	t = getenv("TERM");
@@ -279,7 +313,13 @@ main(int argc, char **argv)
 	/* will use SIGUSR1 for window size hack, so hold it off */
 	omask = sigblock(sigmask(SIGURG) | sigmask(SIGUSR1));
 
-	rem = rcmd(&host, sp->s_port, pw->pw_name, user, term, 0);
+#if defined(linux) && defined(FSUID_HACK)
+	setfsuid(getuid());
+#endif
+	rem = rcmd_af(&host, port, localname, user, term, 0, AF_UNSPEC);
+#if defined(linux) && defined(FSUID_HACK)
+	setfsuid(geteuid());
+#endif
 
 	if (rem < 0) exit(1);
 
@@ -760,7 +800,11 @@ mode(int f)
 		break;
 	  case 1:
                 /* turn off output mappings */
+#if defined(__GNU__) && !defined(OCRNL)
+                tios.c_oflag &= ~ONLCR;
+#else
                 tios.c_oflag &= ~(ONLCR|OCRNL);
+#endif
                 /*
                  * turn off canonical processing and character echo;
                  * also turn off signal checking -- ICANON might be
@@ -771,9 +815,11 @@ mode(int f)
                 tios.c_cc[VTIME] = 1;
                 tios.c_cc[VMIN] = 1;
                 if (eight) tios.c_iflag &= ~(ISTRIP);
+#if defined(TABDLY) && defined(TAB3)
                 /* preserve tab delays, but turn off tab-to-space expansion */
                 if ((tios.c_oflag & TABDLY) == TAB3)
                         tios.c_oflag &= ~TAB3;
+#endif
                 /*
                  *  restore current flow control state
                  */
@@ -830,8 +876,7 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: rlogin [ -%s]%s[-e char] [ -l username ] host\n",
-	    "8EL", " ");
+	    "usage: rlogin [-8ELKd] [-e char] [-i user] [-l user] [-p port] host\n");
 	exit(1);
 }
 

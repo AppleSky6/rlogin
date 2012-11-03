@@ -89,6 +89,7 @@ char rcsid[] =
 
 #ifdef USE_PAM
 #include <security/pam_appl.h>
+#include <security/pam_misc.h>
 #endif
 
 #define _PATH_FTPUSERS	      "/etc/ftpusers"
@@ -99,10 +100,6 @@ char rcsid[] =
 struct from_host from_host;
 #endif
 
-int allow_severity = LOG_INFO;
-int deny_severity = LOG_WARNING;
-
-
 /*
  * remote execute server:
  *	username\0
@@ -112,23 +109,33 @@ int deny_severity = LOG_WARNING;
  */
 
 static void fatal(const char *);
-static void doit(struct sockaddr_in *fromp);
-static void getstr(char *buf, int cnt, const char *err);
+static void doit(struct sockaddr *fromp, socklen_t fromlen);
+static char *getstr(char *, size_t, const char *);
 
 static const char *remote = NULL;
 
 int
 main(int argc, char **argv)
 {
-	struct sockaddr_in from;
+	struct sockaddr_storage from;
+	struct sockaddr *const fromp = (void *)&from;
 	socklen_t fromlen;
 
 	(void)argc;
 
 	fromlen = sizeof(from);
  
-	if (getpeername(0, (struct sockaddr *)&from, &fromlen) < 0) {
+	if (getpeername(0, fromp, &fromlen) < 0) {
 		fprintf(stderr, "rexecd: getpeername: %s\n", strerror(errno));
+		return 1;
+	}
+
+	switch (from.ss_family) {
+	case AF_INET:
+	case AF_INET6:
+		break;
+	default:
+		write(0, "\1Dysfunctional family detected.\n", 32);
 		return 1;
 	}
 
@@ -142,28 +149,29 @@ main(int argc, char **argv)
 	remote = hosts_info(&from_host);
 #else
 	{
-	struct hostent *h = gethostbyaddr((const char *)&from.sin_addr,
-					  sizeof(struct in_addr),
-					  AF_INET);
-	if (!h || !h->h_name) {
+	char hbuf[NI_MAXHOST];
+
+	if (getnameinfo(fromp, fromlen,
+			hbuf, sizeof(hbuf), NULL, 0, NI_NAMEREQD)) {
 		write(0, "\1Where are you?\n", 16);
 		return 1;
 	}
 	/* Be advised that this may be utter nonsense. */
-	remote = strdup(h->h_name);
+	remote = strdup(hbuf);
 	}
 #endif
-	syslog(allow_severity, "connect from %.128s", remote);
-	doit(&from);
+	doit(fromp, fromlen);
 	return 0;
 }
 
+#ifndef USE_PAM
 char	username[20] = "USER=";
 char	homedir[64] = "HOME=";
 char	shell[64] = "SHELL=";
 char	path[sizeof(_PATH_DEFPATH) + sizeof("PATH=")] = "PATH=";
 char	*envinit[] =
 	    {homedir, shell, path, username, 0};
+#endif
 char	**myenviron;
 
 #ifdef USE_PAM
@@ -177,6 +185,8 @@ static int PAM_conv (int num_msg,
   int count = 0, replies = 0;
   struct pam_response *reply = NULL;
   int size = sizeof(struct pam_response);
+
+  (void) appdata_ptr;
 
   #define GET_MEM if (reply) realloc(reply, size); else reply = malloc(size); \
   if (!reply) return PAM_CONV_ERR; \
@@ -221,9 +231,9 @@ static struct pam_conv PAM_conversation = {
 
 
 static void
-doit(struct sockaddr_in *fromp)
+doit(struct sockaddr *fromp, socklen_t fromlen)
 {
-	char cmdbuf[ARG_MAX+1];
+	char *cmdbuf;
 	char user[16], pass[16];
 	struct passwd *pwd;
 	int s = -1;
@@ -273,7 +283,13 @@ doit(struct sockaddr_in *fromp)
  We must connect back to the client here if a port was provided. KRH
 */
 	if (port != 0) {
-		s = socket(AF_INET, SOCK_STREAM, 0);
+		const int family = fromp->sa_family;
+		union {
+			struct sockaddr_in6 in6;
+			struct sockaddr_in in;
+		} *const u = (void *)fromp;
+
+		s = socket(family, SOCK_STREAM, 0);
 		if (s < 0)
 			exit(1);
 
@@ -283,36 +299,43 @@ doit(struct sockaddr_in *fromp)
 			exit(1);
 #endif
 		alarm(60);
-		fromp->sin_port = htons(port);
-		if (connect(s, (struct sockaddr *)fromp, sizeof (*fromp)) < 0)
+		port = htons(port);
+		if (family == AF_INET6)
+			u->in6.sin6_port = port;
+		else
+			u->in.sin_port = port;
+		if (connect(s, fromp, fromlen) < 0)
 			exit(1);
 		alarm(0);
 	}
 
 	getstr(user, sizeof(user), "username too long\n");
 	getstr(pass, sizeof(pass), "password too long\n");
-	getstr(cmdbuf, sizeof(cmdbuf), "command too long\n");
+#ifdef ARG_MAX
+	cmdbuf = getstr(0, ARG_MAX + 1, "command too long\n");
+#else
+	cmdbuf = getstr(0, 0, "command too long\n");
+#endif
 #ifdef USE_PAM
-       #define PAM_BAIL if (pam_error != PAM_SUCCESS) { \
-	       pam_end(pamh, pam_error); exit(1); \
-       }
-       PAM_username = user;
-       PAM_password = pass;
-       pam_error = pam_start("rexec", PAM_username, &PAM_conversation,&pamh);
-       PAM_BAIL;
-       pam_error = pam_authenticate(pamh, 0);
-       PAM_BAIL;
-       pam_error = pam_acct_mgmt(pamh, 0);
-       PAM_BAIL;
-       pam_error = pam_setcred(pamh, PAM_ESTABLISH_CRED);
-       PAM_BAIL;
-       pam_end(pamh, PAM_SUCCESS);
-       /* If this point is reached, the user has been authenticated. */
-       setpwent();
-       pwd = getpwnam(user);
-       endpwent();
+	#define PAM_BAIL if (pam_error != PAM_SUCCESS) { \
+		pam_end(pamh, pam_error); exit(1); \
+	}
+	PAM_username = user;
+	PAM_password = pass;
+	pam_error = pam_start("rexec", PAM_username, &PAM_conversation,&pamh);
+	PAM_BAIL;
+	pam_error = pam_authenticate(pamh, 0);
+	PAM_BAIL;
+	pam_error = pam_acct_mgmt(pamh, 0);
+	PAM_BAIL;
+	pam_error = pam_setcred(pamh, PAM_ESTABLISH_CRED);
+	PAM_BAIL;
+	/* If this point is reached, the user has been authenticated. */
+	setpwent();
+	pwd = getpwnam(user);
+	endpwent();
 #else /* !USE_PAM */
-       /* All of the following issues are dealt with in the PAM configuration
+	/* All of the following issues are dealt with in the PAM configuration
 	  file, so put all authentication/priviledge checks before the
 	  corresponding #endif below. */
 
@@ -375,10 +398,6 @@ doit(struct sockaddr_in *fromp)
 	/* Log successful attempts. */
 	syslog(LOG_INFO, "login from %.128s as %s", remote, user);
 
-	if (chdir(pwd->pw_dir) < 0) {
-		fatal("No remote directory.\n");
-	}
-
 	write(2, "\0", 1);
 	if (port) {
 		/* If we have a port, dup STDERR on that port KRH */
@@ -410,11 +429,32 @@ doit(struct sockaddr_in *fromp)
 		exit(1);
 	}
 
+	if (chdir(pwd->pw_dir) < 0) {
+		fatal("No remote directory.\n");
+	}
+
+#ifdef USE_PAM
+	pam_misc_setenv(pamh, "PATH", _PATH_DEFPATH, 1);
+	PAM_BAIL;
+	pam_misc_setenv(pamh, "HOME", pwd->pw_dir, 1);
+	PAM_BAIL;
+	pam_misc_setenv(pamh, "SHELL", theshell, 1);
+	PAM_BAIL;
+	pam_misc_setenv(pamh, "USER", pwd->pw_name, 1);
+	PAM_BAIL;
+	myenviron = pam_getenvlist(pamh);
+	if (!myenviron) {
+		fprintf(stderr, "pam_misc_copy_env returned NULL\n");
+		exit(1);
+	}
+	pam_end(pamh, PAM_SUCCESS);
+#else
 	strcat(path, _PATH_DEFPATH);
 	myenviron = envinit;
 	strncat(homedir, pwd->pw_dir, sizeof(homedir)-6);
 	strncat(shell, theshell, sizeof(shell)-7);
 	strncat(username, pwd->pw_name, sizeof(username)-6);
+#endif
 	cp2 = strrchr(theshell, '/');
 	if (cp2) cp2++;
 	else cp2 = theshell;
@@ -439,18 +479,46 @@ fatal(const char *msg)
 	exit(1);
 }
 
-static void
-getstr(char *buf, int cnt, const char *err)
+static char *
+getstr(char *buf, size_t cnt, const char *err)
 {
-	char c;
+	char *p;
+	char *end;
+	size_t len;
+
+	end = p = buf;
+	len = cnt;
+	if (p) {
+		end += len;
+		goto read;
+	}
+	if (!len)
+		len = 64;
+	goto alloc;
 
 	do {
-		if (read(0, &c, 1) != 1)
-			exit(1);
-		*buf++ = c;
-		if (--cnt <= 0) {
-			fatal(err);
+		if (p == end) {
+			size_t n;
+
+			if (cnt || len * 2 < len) {
+				fatal(err);
+				exit(1);
+			}
+			len *= 2;
+alloc:
+			n = p - buf;
+			buf = realloc(buf, len);
+			if (!buf) {
+				fatal("out of memory");
+				exit(1);
+			}
+			p = buf + n;
+			end = buf + len;
 		}
-	} while (c != 0);
+read:
+		if (read(0, p, 1) != 1)
+			exit(1);
+	} while (*p++);
+	return buf;
 }
 

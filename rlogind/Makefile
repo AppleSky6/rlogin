@@ -20,7 +20,7 @@ logwtmp.o: logwtmp.h
 auth.o network.o: rlogind.h
 
 install: rlogind
-	install -s -m$(DAEMONMODE) rlogind $(INSTALLROOT)$(SBINDIR)/in.rlogind
+	install -m$(DAEMONMODE) rlogind $(INSTALLROOT)$(SBINDIR)/in.rlogind
 	install -m$(MANMODE) rlogind.8 $(INSTALLROOT)$(MANDIR)/man8/in.rlogind.8
 	ln -sf in.rlogind.8 $(INSTALLROOT)$(MANDIR)/man8/rlogind.8
 

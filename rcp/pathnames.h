@@ -37,4 +37,4 @@
 #include <paths.h>
 
 #define	_PATH_CP	"/bin/cp"
-#define	_PATH_RSH	"/usr/bin/rsh"
+#define	_PATH_RSH	"/usr/bin/netkit-rsh"

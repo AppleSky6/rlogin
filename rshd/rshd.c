@@ -79,6 +79,7 @@ char rcsid[] =
 #include <stdarg.h>
 #include <ctype.h>
 #include <assert.h>
+#include <limits.h>
 
 #if defined(__GLIBC__) && (__GLIBC__ >= 2)
 #define _check_rhosts_file  __check_rhosts_file
@@ -107,8 +108,11 @@ char	*envinit[] =
 extern	char	**environ;
 
 static void error(const char *fmt, ...);
-static void doit(struct sockaddr_in *fromp);
-static void getstr(char *buf, int cnt, const char *err);
+static void doit(struct sockaddr *fromp, socklen_t fromlen);
+static char *getstr(char *, size_t, const char *);
+static int err_conv(
+	int, const struct pam_message **, struct pam_response **, void *
+);
 
 extern int _check_rhosts_file;
 
@@ -145,16 +149,45 @@ static void fail(const char *errorstr,
 	exit(1);
 }
 
-static void getstr(char *buf, int cnt, const char *err) {
-    char c;
-    do {
-	if (read(0, &c, 1) != 1) exit(1);
-	*buf++ = c;
-	if (--cnt == 0) {
-	    error("%s too long\n", err);
-	    exit(1);
+static char *getstr(char *buf, size_t cnt, const char *err) {
+	char *p;
+	char *end;
+	size_t len;
+
+	end = p = buf;
+	len = cnt;
+	if (p) {
+		end += len;
+		goto read;
 	}
-    } while (c != 0);
+	if (!len)
+		len = 64;
+	goto alloc;
+
+	do {
+		if (p == end) {
+			size_t n;
+
+			if (cnt || len * 2 < len) {
+				error("%s too long\n", err);
+				exit(1);
+			}
+			len *= 2;
+alloc:
+			n = p - buf;
+			buf = realloc(buf, len);
+			if (!buf) {
+				error("realloc: %s\n", strerror(errno));
+				exit(1);
+			}
+			p = buf + n;
+			end = buf + len;
+		}
+read:
+		if (read(0, p, 1) != 1)
+			exit(1);
+	} while (*p++);
+	return buf;
 }
 
 static int getint(void) {
@@ -223,12 +256,23 @@ static void stderr_parent(int sock, int pype, int pid) {
 }
 
 
+static int err_conv(
+	int num_msg, const struct pam_message **msg,
+	struct pam_response **resp, void *appdata_ptr
+) {
+	(void) num_msg;
+	(void) msg;
+	(void) resp;
+	(void) appdata_ptr;
+	return PAM_CONV_ERR;
+}
+
 static struct passwd *doauth(const char *remuser, 
 			     const char *hostname, 
 			     const char *locuser)
 {
 #ifdef USE_PAM
-    static struct pam_conv conv = { misc_conv, NULL };
+    static struct pam_conv conv = { err_conv, NULL };
     int retcode;
 #endif
     struct passwd *pwd = getpwnam(locuser);
@@ -275,26 +319,43 @@ static struct passwd *doauth(const char *remuser,
     return pwd;
 #else
     if (pwd->pw_uid==0 && !allow_root_rhosts) return NULL;
-    if (ruserok(hostname, pwd->pw_uid==0, remuser, locuser) < 0) {
+    if (ruserok_af(hostname, pwd->pw_uid==0, remuser, locuser, AF_UNSPEC) < 0) {
 	return NULL;
     }
     return pwd;
 #endif
 }
 
-static const char *findhostname(struct sockaddr_in *fromp,
+static const char *findhostname(struct sockaddr *fromp, socklen_t fromlen,
 				const char *remuser, const char *locuser,
 				const char *cmdbuf) 
 {
-	struct hostent *hp;
 	const char *hostname;
+	char hbuf[NI_MAXHOST];
+	char naddr[NI_MAXHOST];
+	char raddr[NI_MAXHOST];
+	struct addrinfo hints, *res, *res0;
+	int gaierr;
+	struct sockaddr_in v4;
 
-	hp = gethostbyaddr((char *)&fromp->sin_addr, sizeof (struct in_addr),
-			   fromp->sin_family);
+	if (fromp->sa_family == AF_INET6) {
+		const struct sockaddr_in6 *v6p = (const void *)fromp;
+
+		if (IN6_IS_ADDR_V4MAPPED(&v6p->sin6_addr)) {
+			v4.sin_family = AF_INET;
+			v4.sin_addr.s_addr = v6p->sin6_addr.s6_addr32[3];
+			fromp = (struct sockaddr *)&v4;
+		}
+	}
+
+	if ((gaierr = getnameinfo(fromp, fromlen, hbuf, sizeof(hbuf),
+				  NULL, 0, 0))) {
+		error("getnameinfo: %s\n", gai_strerror(gaierr));
+		exit(1);
+	}
 
 	errno = ENOMEM; /* malloc (thus strdup) may not set it */
-	if (hp) hostname = strdup(hp->h_name);
-	else hostname = strdup(inet_ntoa(fromp->sin_addr));
+	hostname = strdup(hbuf);
 
 	if (hostname==NULL) {
 	    /* out of memory? */
@@ -302,36 +363,46 @@ static const char *findhostname(struct sockaddr_in *fromp,
 	    exit(1);
 	}
 
-	/*
-	 * Attempt to confirm the DNS. 
-	 */
-#ifdef	RES_DNSRCH
-	_res.options &= ~RES_DNSRCH;
-#endif
-	hp = gethostbyname(hostname);
-	if (hp == NULL) {
-	    syslog(LOG_INFO, "Couldn't look up address for %s", hostname);
-	    fail("Couldn't get address for your host (%s)\n", 
-		 remuser, inet_ntoa(fromp->sin_addr), locuser, cmdbuf);
-	} 
-	while (hp->h_addr_list[0] != NULL) {
-	    if (!memcmp(hp->h_addr_list[0], &fromp->sin_addr,
-			sizeof(fromp->sin_addr))) {
-		return hostname;
-	    }
-	    hp->h_addr_list++;
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_family = fromp->sa_family;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_CANONNAME;
+	if ((gaierr = getaddrinfo(hbuf, NULL, &hints, &res0))) {
+		syslog(LOG_INFO, "Couldn't look up address for %s: %s",
+		       hbuf, gai_strerror(gaierr));
+		fail("Couldn't get address for your host (%s)\n",
+		     remuser, hbuf, locuser, cmdbuf);
+	} else {
+		if (getnameinfo(fromp, fromlen, naddr, sizeof(naddr),
+				NULL, 0, NI_NUMERICHOST))
+			strcpy(naddr, "???");
+		for (res = res0; res; res = res->ai_next) {
+			if (res->ai_family != fromp->sa_family)
+				continue;
+			if (getnameinfo(res->ai_addr, res->ai_addrlen,
+					raddr, sizeof(raddr), NULL, 0,
+					NI_NUMERICHOST) == 0
+			    && strcmp(naddr, raddr) == 0) {
+				break;  /* match */
+			}
+		}
+		if (res) {
+			freeaddrinfo(res0);
+			return hostname;
+		}
 	}
 	syslog(LOG_NOTICE, "Host addr %s not listed for host %s",
-	       inet_ntoa(fromp->sin_addr), hp->h_name);
+	       naddr, res0->ai_canonname ? res0->ai_canonname : "???");
+	freeaddrinfo(res0);
 	fail("Host address mismatch for %s\n", 
-	     remuser, inet_ntoa(fromp->sin_addr), locuser, cmdbuf);
+	     remuser, naddr, locuser, cmdbuf);
 	return NULL; /* not reachable */
 }
 
 static void
-doit(struct sockaddr_in *fromp)
+doit(struct sockaddr *fromp, socklen_t fromlen)
 {
-	char cmdbuf[ARG_MAX+1];
+	char *cmdbuf;
 	const char *theshell, *shellname;
 	char locuser[16], remuser[16];
 	struct passwd *pwd;
@@ -339,6 +410,14 @@ doit(struct sockaddr_in *fromp)
 	const char *hostname;
 	u_short port;
 	int pv[2], pid, ifd;
+	const int family = fromp->sa_family;
+	union {
+		struct sockaddr_in in;
+		struct sockaddr_in6 in6;
+	} *const u = (void *)fromp;
+#ifdef USE_PAM
+	char **pam_envlist;
+#endif
 
 	signal(SIGINT, SIG_DFL);
 	signal(SIGQUIT, SIG_DFL);
@@ -350,7 +429,7 @@ doit(struct sockaddr_in *fromp)
 
 	if (port != 0) {
 		int lport = IPPORT_RESERVED - 1;
-		sock = rresvport(&lport);
+		sock = rresvport_af(&lport, family);
 		if (sock < 0) {
 		    syslog(LOG_ERR, "can't get stderr port: %m");
 		    exit(1);
@@ -359,9 +438,12 @@ doit(struct sockaddr_in *fromp)
 		    syslog(LOG_ERR, "2nd port not reserved\n");
 		    exit(1);
 		}
-		fromp->sin_port = htons(port);
-		if (connect(sock, (struct sockaddr *)fromp,
-			    sizeof(*fromp)) < 0) {
+		port = htons(port);
+		if (family == AF_INET6)
+			u->in.sin_port = port;
+		else
+			u->in6.sin6_port = port;
+		if (connect(sock, fromp, fromlen) < 0) {
 		    syslog(LOG_INFO, "connect second port: %m");
 		    exit(1);
 		}
@@ -376,10 +458,14 @@ doit(struct sockaddr_in *fromp)
 
 	getstr(remuser, sizeof(remuser), "remuser");
 	getstr(locuser, sizeof(locuser), "locuser");
-	getstr(cmdbuf, sizeof(cmdbuf), "command");
+#ifdef ARG_MAX
+	cmdbuf = getstr(0, ARG_MAX + 1, "command");
+#else
+	cmdbuf = getstr(0, 0, "command");
+#endif
 	if (!strcmp(locuser, "root")) paranoid = 1;
 
-	hostname = findhostname(fromp, remuser, locuser, cmdbuf);
+	hostname = findhostname(fromp, fromlen, remuser, locuser, cmdbuf);
 
 	setpwent();
 	pwd = doauth(remuser, hostname, locuser);
@@ -473,6 +559,11 @@ doit(struct sockaddr_in *fromp)
 	else shellname = theshell;
 
 	endpwent();
+#ifdef USE_PAM
+	pam_envlist = pam_getenvlist(pamh);
+	while (*pam_envlist)
+		putenv(*pam_envlist++);
+#endif
 	if (paranoid) {
 	    syslog(LOG_INFO|LOG_AUTH, "%s@%s as %s: cmd='%s'",
 		   remuser, hostname, locuser, cmdbuf);
@@ -489,18 +580,22 @@ doit(struct sockaddr_in *fromp)
 	exit(1);
 }
 
-static void network_init(int fd, struct sockaddr_in *fromp)
+static void network_init(int fd, struct sockaddr *fromp, socklen_t *fromlen)
 {
 	struct linger linger;
-	socklen_t fromlen;
 	int on=1;
 	int port;
+	int family;
+	union {
+		struct sockaddr_in in;
+		struct sockaddr_in6 in6;
+	} *const u = (void *)fromp;
 
-	fromlen = sizeof(*fromp);
-	if (getpeername(fd, (struct sockaddr *) fromp, &fromlen) < 0) {
+	if (getpeername(fd, fromp, fromlen) < 0) {
 		syslog(LOG_ERR, "getpeername: %m");
 		_exit(1);
 	}
+	family = fromp->sa_family;
 	if (keepalive &&
 	    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (char *)&on,
 	    sizeof(on)) < 0)
@@ -511,13 +606,12 @@ static void network_init(int fd, struct sockaddr_in *fromp)
 	    sizeof (linger)) < 0)
 		syslog(LOG_WARNING, "setsockopt (SO_LINGER): %m");
 
-	if (fromp->sin_family != AF_INET) {
-	    syslog(LOG_ERR, "malformed \"from\" address (af %d)\n",
-		   fromp->sin_family);
+	if (family != AF_INET && family != AF_INET6) {
+	    syslog(LOG_ERR, "malformed \"from\" address (af %d)\n", family);
 	    exit(1);
 	}
 #ifdef IP_OPTIONS
-      {
+      if (family == AF_INET) {
 	u_char optbuf[BUFSIZ/3], *cp;
 	char lbuf[BUFSIZ+1], *lp;
 	socklen_t optsize = sizeof(optbuf);
@@ -528,7 +622,7 @@ static void network_init(int fd, struct sockaddr_in *fromp)
 		ipproto = ip->p_proto;
 	else
 		ipproto = IPPROTO_IP;
-	if (!getsockopt(0, ipproto, IP_OPTIONS, (char *)optbuf, &optsize) &&
+	if (!getsockopt(fd, ipproto, IP_OPTIONS, (char *)optbuf, &optsize) &&
 	    optsize != 0) {
 		lp = lbuf;
 
@@ -543,9 +637,9 @@ static void network_init(int fd, struct sockaddr_in *fromp)
 		syslog(LOG_NOTICE,
 		       "Connection received from %s using IP options"
 		       " (ignored): %s",
-		       inet_ntoa(fromp->sin_addr), lbuf);
+		       inet_ntoa(u->in.sin_addr), lbuf);
 
-		if (setsockopt(0, ipproto, IP_OPTIONS, NULL, optsize) != 0) {
+		if (setsockopt(fd, ipproto, IP_OPTIONS, NULL, optsize) != 0) {
 			syslog(LOG_ERR, "setsockopt IP_OPTIONS NULL: %m");
 			exit(1);
 		}
@@ -556,11 +650,16 @@ static void network_init(int fd, struct sockaddr_in *fromp)
 	/*
 	 * Check originating port for validity.
 	 */
-	port = ntohs(fromp->sin_port);
+	if (family == AF_INET6)
+		port = u->in6.sin6_port;
+	else
+		port = u->in.sin_port;
+	port = ntohs(port);
 	if (port >= IPPORT_RESERVED || port < IPPORT_RESERVED/2) {
-	    syslog(LOG_NOTICE|LOG_AUTH, "Connection from %s on illegal port",
-		   inet_ntoa(fromp->sin_addr));
-	    exit(1);
+		syslog(LOG_NOTICE|LOG_AUTH,
+		       "Connection from %s on illegal port",
+		       findhostname(fromp, *fromlen, "", "", "") ?: "???");
+		exit(1);
 	}
 }
 
@@ -568,7 +667,11 @@ int
 main(int argc, char *argv[])
 {
 	int ch;
-	struct sockaddr_in from;
+	union {
+		struct sockaddr_storage storage;
+		struct sockaddr addr;
+	} from;
+	socklen_t fromlen;
 	_check_rhosts_file=1;
 
 	openlog("rshd", LOG_PID | LOG_ODELAY, LOG_DAEMON);
@@ -611,8 +714,9 @@ main(int argc, char *argv[])
                                "pam_rhosts_auth in /etc/pam.conf");
 #endif /* USE_PAM */
 
-	network_init(0, &from);
-	doit(&from);
+	fromlen = sizeof(from);
+	network_init(0, &from.addr, &fromlen);
+	doit(&from.addr, fromlen);
 	return 0;
 }
 

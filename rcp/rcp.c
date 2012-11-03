@@ -50,6 +50,9 @@ char rcsid[] = "$Id: rcp.c,v 1.15 2000/07/23 04:16:22 dholland Exp $";
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#if defined(linux) && defined(FSUID_HACK)
+#include <sys/fsuid.h>
+#endif
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <dirent.h>
@@ -64,6 +67,7 @@ char rcsid[] = "$Id: rcp.c,v 1.15 2000/07/23 04:16:22 dholland Exp $";
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <stdint.h>
 #include "pathnames.h"
 
 #define	OPTIONS "dfprt"
@@ -90,7 +94,7 @@ static void verifydir(const char *cp);
 static int okname(const char *cp0);
 static int susystem(const char *s);
 static void source(int argc, char *argv[]);
-static void rsource(char *name, struct stat *statp);
+static void rsource(char *name, struct stat64 *statp);
 static void sink(int argc, char *argv[]);
 static BUF *allocbuf(BUF *bp, int fd, int blksize);
 static void nospace(void);
@@ -262,9 +266,15 @@ toremote(const char *targ, int argc, char *argv[])
 					nospace();
 				(void)snprintf(bp, len, "%s -t %s", cmd, targ);
 				host = thost;
-					rem = rcmd(&host, port, pwd->pw_name,
+#if defined(linux) && defined(FSUID_HACK)
+				setfsuid(getuid());
+#endif
+					rem = rcmd_af(&host, port, pwd->pw_name,
 					    tuser ? tuser : pwd->pw_name,
-					    bp, 0);
+					    bp, 0, AF_UNSPEC);
+#if defined(linux) && defined(FSUID_HACK)
+				setfsuid(geteuid());
+#endif
 				if (rem < 0)
 					exit(1);
 #ifdef IP_TOS
@@ -325,7 +335,14 @@ tolocal(int argc, char *argv[])
 		if (!(bp = malloc(len)))
 			nospace();
 		(void)snprintf(bp, len, "%s -f %s", cmd, src);
-			rem = rcmd(&host, port, pwd->pw_name, suser, bp, 0);
+#if defined(linux) && defined(FSUID_HACK)
+		setfsuid(getuid());
+#endif
+			rem = rcmd_af(&host, port, pwd->pw_name, suser, bp, 0,
+				AF_UNSPEC);
+#if defined(linux) && defined(FSUID_HACK)
+		setfsuid(geteuid());
+#endif
 		(void)free(bp);
 		if (rem < 0) {
 			++errs;
@@ -431,20 +448,20 @@ susystem(const char *s)
 static void
 source(int argc, char *argv[])
 {
-	struct stat stb;
+	struct stat64 stb;
 	static BUF buffer;
 	BUF *bp;
-	off_t i;
+	off64_t i;
 	int x, readerr, f, amt;
 	char *last, *name, buf[BUFSIZ];
 
 	for (x = 0; x < argc; x++) {
 		name = argv[x];
-		if ((f = open(name, O_RDONLY, 0)) < 0) {
+		if ((f = open64(name, O_RDONLY, 0)) < 0) {
 			error("rcp: %s: %s\n", name, strerror(errno));
 			continue;
 		}
-		if (fstat(f, &stb) < 0)
+		if (fstat64(f, &stb) < 0)
 			goto notreg;
 		switch (stb.st_mode&S_IFMT) {
 
@@ -482,7 +499,8 @@ notreg:			(void)close(f);
 			}
 		}
 		(void)snprintf(buf, sizeof(buf),
-		    "C%04o %ld %s\n", stb.st_mode&07777, stb.st_size, last);
+		    "C%04o %jd %s\n", stb.st_mode&07777,
+		    (intmax_t) stb.st_size, last);
 		(void)write(rem, buf, (int)strlen(buf));
 		if (response() < 0) {
 			(void)close(f);
@@ -511,11 +529,11 @@ notreg:			(void)close(f);
 }
 
 static void
-rsource(char *name, struct stat *statp)
+rsource(char *name, struct stat64 *statp)
 {
 	DIR *dirp;
 	struct dirent *dp;
-	char *last, *vect[1], path[MAXPATHLEN];
+	char *last, *vect[1], *path;
 
 	if (!(dirp = opendir(name))) {
 		error("rcp: %s: %s\n", name, strerror(errno));
@@ -527,17 +545,22 @@ rsource(char *name, struct stat *statp)
 	else
 		last++;
 	if (pflag) {
-		(void)snprintf(path, sizeof(path),
+		char buf[128];
+		(void)snprintf(buf, sizeof(buf),
 		    "T%ld 0 %ld 0\n", statp->st_mtime, statp->st_atime);
-		(void)write(rem, path, (int)strlen(path));
+		(void)write(rem, buf, (int)strlen(buf));
 		if (response() < 0) {
 			closedir(dirp);
 			return;
 		}
 	}
-	(void)snprintf(path, sizeof(path),
-	    "D%04o %d %s\n", statp->st_mode&07777, 0, last);
+	if (asprintf(&path, "D%04o %d %s\n", statp->st_mode&07777, 0, last) < 0) {
+		error("out of memory\n");
+		closedir(dirp);
+		return;
+	}
 	(void)write(rem, path, (int)strlen(path));
+	free(path);
 	if (response() < 0) {
 		closedir(dirp);
 		return;
@@ -547,13 +570,13 @@ rsource(char *name, struct stat *statp)
 			continue;
 		if (!strcmp(dp->d_name, ".") || !strcmp(dp->d_name, ".."))
 			continue;
-		if (strlen(name) + 1 + strlen(dp->d_name) >= MAXPATHLEN - 1) {
-			error("%s/%s: name too long.\n", name, dp->d_name);
+		if (asprintf(&path, "%s/%s", name, dp->d_name) < 0) {
+			error("out of memory\n");
 			continue;
 		}
-		(void)snprintf(path, sizeof(path), "%s/%s", name, dp->d_name);
 		vect[0] = path;
 		source(1, vect);
+		free(path);
 	}
 	closedir(dirp);
 	(void)write(rem, "E\n", 2);
@@ -610,15 +633,17 @@ sink(int argc, char *argv[])
 {
 	register char *cp;
 	static BUF buffer;
-	struct stat stb;
+	struct stat64 stb;
 	struct timeval tv[2];
 	enum { YES, NO, DISPLAYED } wrerr;
 	BUF *bp;
-	off_t i, j;
+	off64_t i;
+	off_t j;
 	char ch, *targ;
 	const char *why;
 	int amt, count, exists, first, mask, mode;
-	int ofd, setimes, size, targisdir;
+	int ofd, setimes, targisdir;
+	off64_t size;
 	char *np, *vect[1], buf[BUFSIZ];
 
 #define	atime	tv[0]
@@ -637,7 +662,7 @@ sink(int argc, char *argv[])
 	if (targetshouldbedirectory)
 		verifydir(targ);
 	(void)write(rem, "", 1);
-	if (stat(targ, &stb) == 0 && (stb.st_mode & S_IFMT) == S_IFDIR)
+	if (stat64(targ, &stb) == 0 && (stb.st_mode & S_IFMT) == S_IFDIR)
 		targisdir = 1;
 	for (first = 1;; first = 0) {
 		cp = buf;
@@ -731,7 +756,7 @@ sink(int argc, char *argv[])
 		}
 		else
 			np = targ;
-		exists = stat(np, &stb) == 0;
+		exists = stat64(np, &stb) == 0;
 		if (buf[0] == 'D') {
 			if (exists) {
 				if ((stb.st_mode&S_IFMT) != S_IFDIR) {
@@ -752,7 +777,7 @@ sink(int argc, char *argv[])
 			}
 			continue;
 		}
-		if ((ofd = open(np, O_WRONLY|O_CREAT, mode)) < 0) {
+		if ((ofd = open64(np, O_WRONLY|O_CREAT, mode)) < 0) {
 bad:			error("rcp: %s: %s\n", np, strerror(errno));
 			continue;
 		}
@@ -793,7 +818,7 @@ bad:			error("rcp: %s: %s\n", np, strerror(errno));
 		if (count != 0 && wrerr == NO &&
 		    write(ofd, bp->buf, count) != count)
 			wrerr = YES;
-		if (ftruncate(ofd, size)) {
+		if (ftruncate64(ofd, size)) {
 			error("rcp: can't truncate %s: %s\n", np,
 			    strerror(errno));
 			wrerr = DISPLAYED;
@@ -827,10 +852,10 @@ screwup:
 static BUF *
 allocbuf(BUF *bp, int fd, int blksize)
 {
-	struct stat stb;
+	struct stat64 stb;
 	int size;
 
-	if (fstat(fd, &stb) < 0) {
+	if (fstat64(fd, &stb) < 0) {
 		error("rcp: fstat: %s\n", strerror(errno));
 		return(0);
 	}

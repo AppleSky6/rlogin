@@ -40,7 +40,7 @@
 .Nd remote login server
 .Sh SYNOPSIS
 .Nm rlogind
-.Op Fl ahlLn
+.Op Fl afhlLn
 .Sh DESCRIPTION
 .Nm Rlogind
 is the server for the 
@@ -52,7 +52,10 @@ Options supported by
 .Nm rlogind :
 .Bl -tag -width Ds
 .It Fl a
-Ask hostname for verification.
+This option exists for compatibility with historical systems.
+.It Fl f
+Disable the Nagle algorithm.  This is only needed to work around some broken
+operating systems.
 .It Fl h
 Permit use of superuser 
 .Dq Pa .rhosts
@@ -75,9 +78,7 @@ Disable keep-alive messages.
 .El
 .Pp
 The \-h, \-l, and \-L flags are not used if PAM (Pluggable
-Authentication Module) support is in use. In this case the same
-effects can be achieved by editing
-.Pa /etc/pam.conf .
+Authentication Module) support is in use.
 .Pp
 The
 .Fl h
@@ -124,12 +125,7 @@ and
 .Xr named 8 ) .
 If the hostname cannot be determined,
 the dot-notation representation of the host address is used.
-If the hostname is in the same domain as the server (according to
-the last two components of the domain name),
-or if the
-.Fl a
-option is given,
-the addresses for the hostname are requested,
+The addresses for the hostname are requested,
 verifying that the name and address correspond.
 Normal authentication is bypassed if the address verification fails.
 .El

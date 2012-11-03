@@ -10,7 +10,7 @@ $(PROG): $(OBJS)
 	$(CC) $(LDFLAGS) $^ $(LIBS) -o $@
 
 install: $(PROG)
-	install -s -o root -m$(SUIDMODE) $(PROG) $(INSTALLROOT)$(BINDIR)
+	install -o root -m$(SUIDMODE) $(PROG) $(INSTALLROOT)$(BINDIR)
 	install -m $(MANMODE) $(PROG).1 $(INSTALLROOT)$(MANDIR)/man1
 
 clean:

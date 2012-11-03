@@ -47,6 +47,9 @@ char rcsid[] = "$Id: rsh.c,v 1.13 2000/07/23 04:16:24 dholland Exp $";
 #include <sys/ioctl.h>
 #include <sys/file.h>
 #include <sys/time.h>
+#if defined(linux) && defined(FSUID_HACK)
+#include <sys/fsuid.h>
+#endif
 
 #include <netinet/in.h>
 #include <netdb.h>
@@ -92,7 +95,11 @@ main(int argc, char *argv[])
 	if (p) p++;
 	else p = argv[0];
 
+#ifdef debian
+	if (!strcmp(p, "rsh") || !strcmp(p, "netkit-rsh")) asrsh = 1;
+#else
 	if (!strcmp(p, "rsh")) asrsh = 1;
+#endif
 	else host = p;
 
 	/* handle "rsh host flags" */
@@ -163,7 +170,14 @@ main(int argc, char *argv[])
 		exit(1);
 	}
 
-	rem = rcmd(&host, sp->s_port, pw->pw_name, user, args, &rfd2);
+#if defined(linux) && defined(FSUID_HACK)
+	setfsuid(getuid());
+#endif
+	rem = rcmd_af(&host, sp->s_port, pw->pw_name, user, args, &rfd2,
+		      AF_UNSPEC);
+#if defined(linux) && defined(FSUID_HACK)
+	setfsuid(geteuid());
+#endif
 
 	if (rem < 0)
 		exit(1);
