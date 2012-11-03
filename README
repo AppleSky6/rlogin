@@ -1,5 +1,9 @@
-This is the new rlogin. It compiles out of the box on debian, weblinux, 
+This is the new rlogin (no longer netkit). It compiles out of the box on 
+debian, 
+weblinux, 
 ubuntu and many others. There is a debian repository, just add the line 
 'deb http://weblinux.sourceforge.net/debian-repo binary/' without the 
 quotes to /etc/apt/sources.list on debian or derivitives (ubuntu and 
-weblinux). Rlogin may not be as secure as ssh, but it is faster.
+weblinux). Rlogin may not be as secure as ssh, but it is faster. Send 
+bugs to admin@wlinux.mobi, or use the forum at 
+http://rlogin.sourceforge.net.

@@ -100,8 +100,7 @@ Bugs:
 	Please don't report known bugs (see the BUGS file(s)) unless you
 	are including fixes. :-)
 
-	Mail should be sent to: netbug@ftp.uk.linux.org
-
+	Mail should be sent to: admin@wlinux.mobi
 
 Early in April 2000, a hacker broke into the machine that was hosting
 the netkit bug database for me and trashed it. Unfortunately, it seems
@@ -110,7 +109,7 @@ mid-January) was lost. So, if you sent something and didn't hear back,
 or you sent something, heard back, but the changes failed to appear in
 this release (unlikely but possible) - please resend.
 
-Please see http://www.hcs.harvard.edu/~dholland/computers/netkit.html
+Please see http://rlogin.sourceforge.net/netkit.html
 if you are curious why it was so long between the 0.10 and 0.16 releases.
 
 Future plans for netkit maintenance are still up in the air, but in the
